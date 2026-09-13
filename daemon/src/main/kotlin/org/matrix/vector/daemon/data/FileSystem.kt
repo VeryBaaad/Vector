@@ -51,6 +51,42 @@ private const val TAG = "VectorFileSystem"
 private const val SYSTEM_FILE_CONTEXT = "u:object_r:system_file:s0"
 
 /**
+ * Where the HyperOS Rust Runtime's spawner lives. Its presence is what decides whether any of the
+ * publishing below happens at all, so a device without that runtime pays nothing for it.
+ */
+private const val HYOS_SPAWNER_PATH = "/system_ext/bin/hyos_spawner"
+
+/**
+ * The index a process spawned by [HYOS_SPAWNER_PATH] reads to find the modules in its scope.
+ *
+ * Everything here has a counterpart in `zygisk/src/main/cpp/hyos_runtime.cpp`, which is the only
+ * reader; the two sets of constants have to agree or the feature quietly does nothing.
+ *
+ * The pointer file is the part that makes the random directory findable without listing /data/misc,
+ * which an app-domain process may not do. It sits directly in /data/misc because that directory
+ * belongs to the system uid with mode 0771: nothing running as an application can create an entry
+ * there, and the file itself is mode 0600, so only root — which is what the companion runs as — can
+ * read it. An application therefore cannot learn where the index is, and so cannot ask whether it
+ * is being hooked.
+ */
+private const val HYOS_POINTER_PATH = "/data/misc/vector.hyos"
+private const val HYOS_INDEX_DIR = "hyos"
+private const val HYOS_INDEX_MARKER = ".version"
+private const val HYOS_INDEX_MAGIC = "vector-hyos 1"
+
+/**
+ * The subdirectory of the misc root holding copies of module libraries that a process cannot map
+ * out of the module's APK.
+ *
+ * Two of them, because the two readers have different lifetimes and each prunes what it no longer
+ * needs. system_server's copies are pruned down to the modules still bound for system_server; the
+ * HyperOS Runtime's, to the modules still in some scope. Sharing one directory would have each
+ * pass delete the other's copies, leaving whichever reader ran first with nothing to load.
+ */
+private const val STAGED_LIBRARY_DIR = "lib"
+private const val HYOS_LIBRARY_DIR = "libhyos"
+
+/**
  * What came of trying to load a module APK.
  *
  * The loader used to answer every refusal with the same null, so a module built against libxposed
@@ -73,6 +109,16 @@ sealed interface ModuleLoad {
 /** The APK when it loaded and null when it did not, for callers with nothing to say about why. */
 val ModuleLoad.apkOrNull: ModuleCode?
   get() = (this as? ModuleLoad.Loaded)?.apk
+
+/**
+ * One native library the index names for one process: which module asked for it, the name that
+ * module declared, and the absolute path the process should load it from.
+ */
+data class HyosModuleLibrary(
+    val modulePackage: String,
+    val libraryName: String,
+    val libraryPath: String,
+)
 
 object FileSystem {
   val basePath: Path = Paths.get("/data/adb/lspd")
@@ -488,11 +534,19 @@ object FileSystem {
    *
    * Returns null when the module ships nothing for this ABI or the copy failed, in which case the
    * module still loads and only its native part fails, exactly as it does today.
+   *
+   * [dirName] selects which of the readers the copy is for; see [STAGED_LIBRARY_DIR]. The two sets
+   * are kept apart because each is pruned against a different notion of "still needed".
    */
-  fun stageNativeLibraries(root: Path, packageName: String, apkPath: String): String? =
+  fun stageNativeLibraries(
+      root: Path,
+      packageName: String,
+      apkPath: String,
+      dirName: String = STAGED_LIBRARY_DIR,
+  ): String? =
       runCatching {
             val apk = File(apkPath)
-            val dir = root.resolve("lib").resolve(packageName)
+            val dir = root.resolve(dirName).resolve(packageName)
 
             // Re-extract only when the APK behind the copy changed. Getting this wrong in the
             // lenient direction would leave system_server running a module's superseded native
@@ -546,10 +600,14 @@ object FileSystem {
    * Drops staged libraries belonging to modules that are no longer bound for system_server, so an
    * uninstalled or rescoped module does not leave a copy of its native code behind for good.
    */
-  fun pruneStagedNativeLibraries(root: Path?, keep: Set<String>) {
+  fun pruneStagedNativeLibraries(
+      root: Path?,
+      keep: Set<String>,
+      dirName: String = STAGED_LIBRARY_DIR,
+  ) {
     if (root == null) return
     runCatching {
-          val libRoot = root.resolve("lib")
+          val libRoot = root.resolve(dirName)
           if (!libRoot.isDirectory()) return
           Files.list(libRoot).use { stream ->
             stream
@@ -558,6 +616,110 @@ object FileSystem {
           }
         }
         .onFailure { Log.e(TAG, "Failed to prune staged native libraries", it) }
+  }
+
+  /** Whether this device has the HyperOS Rust Runtime the index below is published for. */
+  fun hasHyosRuntime(): Boolean = File(HYOS_SPAWNER_PATH).exists()
+
+  /**
+   * Stages a module's native libraries for the HyperOS Runtime's reader rather than system_server's.
+   *
+   * A process there cannot be told a search path the way an injected ART process can, so it is
+   * handed absolute paths in the index below and needs the libraries to exist at those paths. The
+   * APK itself would do — /data/app is readable and mappable by any app domain — but the entry has
+   * to be STORED inside the zip for the loader to open it, and a module that compressed its
+   * libraries would silently lose its native part. A copy has neither problem.
+   */
+  fun stageHyosNativeLibraries(root: Path, packageName: String, apkPath: String): String? =
+      stageNativeLibraries(root, packageName, apkPath, HYOS_LIBRARY_DIR)
+
+  /** Drops HyperOS-staged libraries of modules that are in no scope any more. */
+  fun pruneHyosNativeLibraries(root: Path?, keep: Set<String>) {
+    pruneStagedNativeLibraries(root, keep, HYOS_LIBRARY_DIR)
+  }
+
+  /**
+   * Publishes the index a process spawned by [HYOS_SPAWNER_PATH] reads to find the modules in its
+   * scope.
+   *
+   * The whole file lives inside the daemon's random directory and is readable by path to anything
+   * that knows the path, which is deliberate: the reader is a process with no binder and no JVM, so
+   * a file is the only channel there is. What keeps the list private is that the path is not
+   * discoverable — see [HYOS_POINTER_PATH] for the half of that which the companion reads.
+   *
+   * A process with no entry is in nobody's scope, and files for processes that stopped being in
+   * scope are removed, so the index always describes exactly the current configuration.
+   */
+  fun publishHyosIndex(miscPath: Path, index: Map<String, List<HyosModuleLibrary>>) {
+    runCatching {
+          val dir = miscPath.resolve(HYOS_INDEX_DIR)
+          Files.createDirectories(dir)
+
+          val written = mutableSetOf<String>()
+          index.forEach { (processName, libraries) ->
+            // A process name is a manifest string that becomes a file name here. Android's own
+            // validation is not something to lean on for a write performed as root, so anything
+            // that is not a plain name is refused rather than resolved.
+            if (processName.isEmpty() || processName.contains('/') || processName == "." ||
+                processName == "..") {
+              Log.w(TAG, "Refusing to publish an index under the name '$processName'")
+              return@forEach
+            }
+            val target = dir.resolve(processName)
+            val text =
+                buildString {
+                  appendLine(HYOS_INDEX_MAGIC)
+                  libraries.forEach {
+                    append(it.modulePackage)
+                    append('\t')
+                    append(it.libraryName)
+                    append('\t')
+                    append(it.libraryPath)
+                    append('\n')
+                  }
+                }
+            Files.writeString(
+                target,
+                text,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+            )
+            Os.chmod(target.toString(), "644".toInt(8))
+            written.add(processName)
+          }
+
+          val marker = dir.resolve(HYOS_INDEX_MARKER)
+          Files.writeString(
+              marker,
+              "$HYOS_INDEX_MAGIC\n",
+              StandardOpenOption.CREATE,
+              StandardOpenOption.TRUNCATE_EXISTING,
+          )
+          Os.chmod(marker.toString(), "644".toInt(8))
+
+          Files.list(dir).use { stream ->
+            stream
+                .filter {
+                  val name = it.fileName.toString()
+                  name != HYOS_INDEX_MARKER && name !in written
+                }
+                .forEach { it.toFile().delete() }
+          }
+
+          // The daemon runs with a zero umask, so every mode here is set rather than inherited. The
+          // directory is searchable but not listable, the way the rest of the staged tree is, and
+          // the label is what lets a process running as an application read it at all.
+          Os.chmod(dir.toString(), "711".toInt(8))
+          setSelinuxContextRecursive(dir, "u:object_r:xposed_data:s0")
+
+          val pointer = File(HYOS_POINTER_PATH)
+          pointer.writeText("misc=$miscPath\n")
+          // 0600 and owned by the daemon: the companion, which is root, is the only reader meant to
+          // have this. An application that could read it would learn where the index is and could
+          // then ask whether it is being hooked.
+          Os.chmod(pointer.absolutePath, "600".toInt(8))
+        }
+        .onFailure { Log.e(TAG, "Failed to publish the HyperOS Runtime index", it) }
   }
 
   fun toGlobalNamespace(path: String): File {
