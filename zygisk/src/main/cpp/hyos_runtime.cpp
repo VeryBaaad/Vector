@@ -1,4 +1,6 @@
 #include <dirent.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -7,6 +9,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -88,6 +91,25 @@ constexpr char kRequestMiscRoot = 'M';
 /// Longest reply accepted from the companion, so a confused peer cannot exhaust memory.
 constexpr size_t kMaxReplyLength = 4096;
 
+/**
+ * Where the companion reports whether this process's hyperos support is actually working.
+ *
+ * A client connects and reads one byte: `1` means the Zygisk Next Runtime API was registered and
+ * applications will be specialized, anything else means the runtime did not want us. It is the
+ * whole interface, and it exists because the daemon has no other way to ask: the daemon is a Java
+ * process, and the connection the spawner holds is not one it can reach.
+ *
+ * The path is the same one LSPosed 2.2.0 uses, recovered from its released daemon -- its
+ * `ILSPManagerService` transaction 67 connects here and reads exactly that byte, and its manager
+ * turns the answer into the "HyperOS Runtime injection failed" notice the user sees. Being under
+ * /data/adb/lspd, which is mode 0700 owned by root, is deliberate: the companion and the daemon are
+ * both root, and nothing running as an application may ask.
+ */
+constexpr auto kMonitorPath = "/data/adb/lspd/hyos_monitor";
+
+/// How long the companion waits for the spawner's status byte before assuming the worst.
+constexpr time_t kStatusByteTimeoutSeconds = 2;
+
 // --- The Zygisk Next view of this process -----------------------------------------------------
 
 const ZygiskNextAPI *g_api = nullptr;
@@ -110,6 +132,11 @@ int g_companion_fd = -1;
 // feature off rather than failing -- an ordinary Zygisk process and a hyos_spawner running without
 // us are both perfectly good outcomes.
 bool g_registered = false;
+
+// What the monitor hands out: 1 once the Runtime API is registered, 0 until then and forever if it
+// never is. Written by the companion when the spawner reports, read by every monitor client -- two
+// threads of one process, which is why it is atomic rather than plain.
+std::atomic<char> g_injection_status{0};
 
 // Whether this process has already done its work. A child is forked once and specializes once, but
 // a runtime is free to call the callback again, and loading a module's libraries twice would run
@@ -443,12 +470,87 @@ void *ServeCompanion(void *arg) {
     return nullptr;
 }
 
+/**
+ * @brief Answers the daemon's question about this runtime.
+ *
+ * Started with the companion rather than with the first connection, because "started and nothing
+ * registered yet" has to be answerable: it is what a runtime the loader refused looks like, and the
+ * difference between that and no companion at all is the whole reason the daemon asks.
+ */
+void *ServeMonitor(void *) {
+    // A socket left behind by a companion that was killed would make every later bind fail, and the
+    // daemon would keep reading the old inode instead of ours.
+    unlink(kMonitorPath);
+
+    const int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0) {
+        LOGE("VectorHyperRuntime: cannot create {}: {}.", kMonitorPath, strerror(errno));
+        return nullptr;
+    }
+
+    struct sockaddr_un address {};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, kMonitorPath, sizeof(address.sun_path));
+    if (bind(listener, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) != 0 ||
+        listen(listener, 8) != 0) {
+        LOGE("VectorHyperRuntime: cannot listen on {}: {}.", kMonitorPath, strerror(errno));
+        close(listener);
+        return nullptr;
+    }
+    // The daemon runs as root and the directory is root-only, so the mode is not what admits it;
+    // it is set anyway so that a stale socket is never what refuses a legitimate reader.
+    if (chmod(kMonitorPath, 0666) != 0) {
+        LOGW("VectorHyperRuntime: cannot relax {}: {}.", kMonitorPath, strerror(errno));
+    }
+    LOGI("VectorHyperRuntime: reporting injection status on {}.", kMonitorPath);
+
+    for (;;) {
+        const int client = accept(listener, nullptr, nullptr);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        const char status = g_injection_status.load();
+        if (write(client, &status, 1) != 1) {
+            LOGD("VectorHyperRuntime: a monitor client went away before its answer.");
+        }
+        close(client);
+    }
+    close(listener);
+    return nullptr;
+}
+
 void OnCompanionLoaded() {
     LOGI("VectorHyperRuntime: companion loaded in pid {}.", static_cast<int>(getpid()));
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, ServeMonitor, nullptr) != 0) {
+        LOGE("VectorHyperRuntime: cannot serve {} on a thread; the daemon will see no runtime.",
+             kMonitorPath);
+        return;
+    }
+    pthread_detach(thread);
 }
 
 void OnModuleConnected(int fd) {
     LOGI("VectorHyperRuntime: companion connected on fd {}.", fd);
+
+    // The spawner's first write is its status byte, and it is written before any fork, so it is
+    // already on its way when this runs. Bounded anyway: a spawner that died between connecting and
+    // writing must not leave the companion -- and the loader's own loop that called us -- stuck.
+    struct timeval timeout {};
+    timeout.tv_sec = kStatusByteTimeoutSeconds;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    char status = 0;
+    if (read(fd, &status, 1) == 1 && status == 1) {
+        g_injection_status.store(1);
+        LOGI("VectorHyperRuntime: the runtime API is registered; the daemon will be told so.");
+    } else {
+        g_injection_status.store(0);
+        LOGW("VectorHyperRuntime: no registration status arrived; the daemon will be told that "
+             "injection is not working.");
+    }
+
     pthread_t thread;
     auto *argument = reinterpret_cast<void *>(static_cast<intptr_t>(fd));
     if (pthread_create(&thread, nullptr, ServeCompanion, argument) == 0) {
@@ -544,6 +646,16 @@ void OnModuleLoaded(void *self_handle, const ZygiskNextAPI *api) {
             LOGW("VectorHyperRuntime: cannot bound the companion reply: {}.", strerror(errno));
         }
         LOGI("VectorHyperRuntime: companion connection established on fd {}.", g_companion_fd);
+
+        // The companion's first read is this byte, before it serves anything else, so it has to
+        // arrive before the first fork -- which it does, because it is written here and children
+        // only exist once the spawner's main runs. It is the answer the daemon will be handed when
+        // it asks whether this runtime is being injected at all.
+        const char status = g_registered ? 1 : 0;
+        if (write(g_companion_fd, &status, 1) != 1) {
+            LOGW("VectorHyperRuntime: cannot report the injection status to the companion: {}.",
+                 strerror(errno));
+        }
     }
 }
 

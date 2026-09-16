@@ -9,6 +9,7 @@ import android.os.Process
 import android.os.RemoteException
 import android.os.SELinux
 import android.os.SharedMemory
+import android.os.SystemProperties
 import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
@@ -51,13 +52,19 @@ private const val TAG = "VectorFileSystem"
 private const val SYSTEM_FILE_CONTEXT = "u:object_r:system_file:s0"
 
 /**
- * Where the HyperOS Rust Runtime's spawner lives. Its presence is what decides whether any of the
- * publishing below happens at all, so a device without that runtime pays nothing for it.
+ * The properties the HyperOS Rust Runtime advertises itself with.
+ *
+ * Read rather than looking for `/system_ext/bin/hyos_spawner`: the runtime can be switched off on a
+ * device that still ships that binary, and an index nothing will ever read is work done for
+ * nothing. These are the same two properties LSPosed 2.2.0 reads for the same decision, in its
+ * daemon's `ILSPManagerService` transaction 67; they were recovered from its released daemon.
  */
-private const val HYOS_SPAWNER_PATH = "/system_ext/bin/hyos_spawner"
+private const val HYOS_ACTIVE_PROPERTY = "rust.runtime_active"
+private const val HYOS_VERSION_PROPERTY = "rust.runtime_version"
 
 /**
- * The index a process spawned by [HYOS_SPAWNER_PATH] reads to find the modules in its scope.
+ * The index a process spawned by the HyperOS Rust Runtime's spawner reads to find the modules in
+ * its scope.
  *
  * Everything here has a counterpart in `zygisk/src/main/cpp/hyos_runtime.cpp`, which is the only
  * reader; the two sets of constants have to agree or the feature quietly does nothing.
@@ -618,8 +625,10 @@ object FileSystem {
         .onFailure { Log.e(TAG, "Failed to prune staged native libraries", it) }
   }
 
-  /** Whether this device has the HyperOS Rust Runtime the index below is published for. */
-  fun hasHyosRuntime(): Boolean = File(HYOS_SPAWNER_PATH).exists()
+  /** Whether this device runs applications on the HyperOS Rust Runtime at all. */
+  fun hasHyosRuntime(): Boolean =
+      SystemProperties.getBoolean(HYOS_ACTIVE_PROPERTY, false) &&
+          SystemProperties.get(HYOS_VERSION_PROPERTY).orEmpty().isNotEmpty()
 
   /**
    * Stages a module's native libraries for the HyperOS Runtime's reader rather than system_server's.
@@ -639,7 +648,7 @@ object FileSystem {
   }
 
   /**
-   * Publishes the index a process spawned by [HYOS_SPAWNER_PATH] reads to find the modules in its
+   * Publishes the index a process spawned by the HyperOS Rust Runtime reads to find the modules in its
    * scope.
    *
    * The whole file lives inside the daemon's random directory and is readable by path to anything
