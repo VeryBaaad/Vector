@@ -34,4 +34,4 @@ They are included as git submodules to ensure version consistency and timely upd
 ## Patches
 
 -   [patches/shadowhook](patches/shadowhook):
-    Used to bypass detection by `libshadowhook_nothing.so`.
+    Used to remove the mandatory dependency on `libshadowhook_nothing.so`.
