@@ -20,6 +20,6 @@ dependencies {
     compileOnly(libs.androidx.annotation)
     compileOnly(libs.libxposed.annotation)
     compileOnly(projects.hiddenapi.stubs)
-    compileOnly(libs.libxposed.service)
-    compileOnly(libs.libxposed.interfaces)
+    api(libs.libxposed.service)
+    api(libs.libxposed.interfaces)
 }
