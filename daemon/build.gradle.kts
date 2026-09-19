@@ -150,4 +150,7 @@ dependencies {
   implementation(projects.services.managerService)
   compileOnly(libs.androidx.annotation)
   compileOnly(projects.hiddenapi.stubs)
+  compileOnly(libs.libxposed.api)
+  compileOnly(libs.libxposed.service)
+  compileOnly(libs.libxposed.interfaces)
 }
